@@ -171,61 +171,77 @@ class Palletizer:
         return WorldState(obstacles=obs) if obs else None
 
     async def remove(self):
-        """Pick the top box off the pallet and set it back on the pick-station."""
+        """Remove boxes backwards"""
+
         if not self.placed:
             print("No boxes left to remove!")
             return False
 
-        # Always remove the most recently placed box
+        # Always remove the most recently plcaed box
         seq = len(self.placed) - 1
-        x, y, z_center = self.placed[seq]
-        z_top = z_center + BOX_H / 2      # top face of the target box
-        z_grasp = z_top - GRASP_DEPTH     # press the cups onto it
-        z_clear = self._clear_tip(z_top)  # transit height above the stack
 
+        x,y,z_center = self.placed[seq]
+
+        # top box
+        z_top = z_center + BOX_H/2
+
+        # vacuum cups position
+        z_grasp = z_top - GRASP_DEPTH
+
+        # good position above stack
+        z_clear = self._clear_tip(z_top)
+
+        # gripper is open
         await self.gripper.open()
 
-        # Approach and descend. The target box leaves the obstacle set (the
-        # cups are about to press onto it); the rest of the stack stays in.
-        await self.move_gripper(down_pose(x, y, z_clear), self.obstacles(exclude_index=seq))
-        await self.move_gripper(down_pose(x, y, z_grasp), self.obstacles(exclude_index=seq))
+        # Move above target box and delete target from obstacle
+        await self.move_gripper(down_pose(x, y, z_clear), self.obstacles(exclude_index=seq),
+        )
+
+        await self.move_gripper(down_pose(x,y,z_grasp), self.obstacles(exclude_index=seq),)
 
         grabbed = await self.gripper.grab()
-        # the simulated EPick seals after grab_delay_ms, so the first read can
-        # report False before the seal has formed
-        await asyncio.sleep(1.0)
-        if grabbed is False:
-            print(f"grab on box {seq} reported False (seal may still be forming)")
 
-        await helpers.attach_box(self.robot, seq, BOX_H)
 
-        home = await helpers.pick_home_pose(self.robot, BOX_H)
-        drop = await helpers.grasp_pose(self.robot, BOX_H)
+        # visually looks like the gripper grabs the box, but it actually fails
+        if grabbed is False: 
+            print(f"Failed to grab box {seq}")
 
-        # The box visual is parented to the gripper until show_box below, and
-        # that parenting lives on the machine — it survives this process. If a
-        # move fails mid-carry, put the visual back on the pallet instead of
-        # leaving it welded to the arm for every later run.
+
+
+        # Visualization: not sure if it will work
+        await helpers.attach_box(self.robot, seq, BOX_H,)
+
+        # no longer part of the pallet stack
+        self.placed.pop()
+
+        # attach_box parents the visual to the gripper on the machine itself, so
+        # it outlives this process — if a move fails mid-carry, put the visual
+        # back on the pallet instead of leaving it stuck to the arm forever
         try:
-            # lift straight up, transit, then straight down onto the station.
-            # The target box is still in self.placed until the drop succeeds,
-            # so keep excluding it — its recorded pallet pose is stale now.
-            await self.move_gripper(down_pose(x, y, z_clear), self.obstacles(exclude_index=seq))
-            await self.move_gripper(home, self.obstacles(exclude_index=seq))
-            await self.move_gripper(
-                down_pose(drop.x, drop.y, drop.z), self.obstacles(exclude_index=seq)
-            )
+            #lift straight up
+            await self.move_gripper(down_pose(x,y,z_clear), self.obstacles(),)
+
+            # return to pick station
+            home = await helpers.pick_home_pose(self.robot, BOX_H,)
+
+            drop = await helpers.grasp_pose(self.robot, BOX_H,)
+
+            # good approach
+            await self.move_gripper(home, self.obstacles(),)
+
+            # Lower box back to station
+            await self.move_gripper(down_pose(drop.x, drop.y, drop.z), self.obstacles(),)
         except Exception:
             await helpers.show_box(self.robot, seq, x, y, z_center)
             raise
 
-        # release, land the visual on the station, and only now take the box
-        # off the stack — a failed carry above stays retryable
+        # release
         await self.gripper.open()
-        await helpers.show_box(self.robot, seq, drop.x, drop.y, drop.z - BOX_H / 2)
-        self.placed.pop()
+        await helpers.show_box(self.robot, seq, drop.x, drop.y, drop.z - BOX_H/2)
+        # return up
+        await self.move_gripper(home, self.obstacles(),)
 
-        await self.move_gripper(home, self.obstacles())
         return True
 
     async def unpack(self):
