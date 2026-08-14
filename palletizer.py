@@ -3,7 +3,6 @@ import sys
 import helpers
 from viam.components.gripper import Gripper
 from viam.services.motion import MotionClient
-from viam.proto.common import Pose, PoseInFrame
 from helpers import connect
 from viam.components.arm import Arm
 from viam.proto.component.arm import JointPositions
@@ -74,7 +73,9 @@ class Palletizer:
         """Pick the box at the pick-station and lift it (box ends up held)."""
         home = await helpers.pick_home_pose(self.robot, BOX_H)
         grasp = await helpers.grasp_pose(self.robot, BOX_H)
-        await self.move_gripper(home, self.obstacles(held=True))
+        # nothing is held yet — modeling a phantom held box here makes the
+        # planner refuse start poses that touch the stack
+        await self.move_gripper(home, self.obstacles())
         await helpers.show_box(self.robot, seq, grasp.x, grasp.y, grasp.z - BOX_H / 2)
         await self.move_gripper(down_pose(grasp.x, grasp.y, grasp.z - GRASP_DEPTH))
         await self.gripper.grab()
@@ -121,11 +122,6 @@ class Palletizer:
         await helpers.show_box(self.robot, seq, x, y, z_tip - BOX_H / 2)
         self.placed.append((x, y, z_tip - BOX_H / 2))
 
-        # await self.move_gripper(down_pose(x, y, z_tip), self.obstacles())
-        # await self.gripper.open()
-        # await helpers.show_box(self.robot, seq, x, y, z_tip - BOX_H / 2)
-        # self.placed.append((x, y, z_tip - BOX_H / 2))
-
     async def run(self):
         """Pack the whole pallet: two layers of four."""
         await helpers.clear_boxes(self.robot)
@@ -151,97 +147,82 @@ class Palletizer:
                 )],
             )
 
-        # obs = [cuboid(f"placed-{i}", "world", x, y, z)
-        #     for i, (x, y, z) in enumerate(self.placed)]
-        # if held:
-        #     obs.append(cuboid("held", helpers.GRIPPER, 0, 0, BOX_H / 2))
-        # return WorldState(obstacles=obs) if obs else None
-
         obs = [cuboid(f"placed-{i}", "world", x, y, z)
-        for i, (x, y, z) in enumerate(self.placed)
-        if i != exclude_index]
-
-        # this is causing 
-        '''
-        grpclib.exceptions.GRPCError: (<Status.UNKNOWN: 2>, 'fatal early collision: obstacle constraint:
-        violation between gripper-1:epick-bracket and held geometries', None)
-        '''
-        # if held:
-        #     obs.append(cuboid("held", helpers.GRIPPER, 0, 0, BOX_H / 2))
+               for i, (x, y, z) in enumerate(self.placed)
+               if i != exclude_index]
+        if held:
+            obs.append(cuboid("held", helpers.GRIPPER, 0, 0, BOX_H / 2))
         return WorldState(obstacles=obs) if obs else None
 
     async def remove(self):
-        """Remove boxes backwards"""
-
+        """Pick the top box off the pallet and set it back on the pick-station."""
         if not self.placed:
             print("No boxes left to remove!")
             return False
 
-        # Always remove the most recently plcaed box
+        # Always remove the most recently placed box
         seq = len(self.placed) - 1
+        x, y, z_center = self.placed[seq]
+        z_top = z_center + BOX_H / 2      # top face of the target box
+        z_grasp = z_top - GRASP_DEPTH     # press the cups onto it
+        z_clear = self._clear_tip(z_top)  # transit height above the stack
 
-        x,y,z_center = self.placed[seq]
-
-        # top box
-        z_top = z_center + BOX_H/2
-
-        # vacuum cups position
-        z_grasp = z_top - GRASP_DEPTH
-
-        # good position above stack
-        z_clear = self._clear_tip(z_top)
-
-        # gripper is open
         await self.gripper.open()
 
-        # Move above target box and delete target from obstacle
-        await self.move_gripper(down_pose(x, y, z_clear), self.obstacles(exclude_index=seq),
-        )
-
-        await self.move_gripper(down_pose(x,y,z_grasp), self.obstacles(exclude_index=seq),)
+        # Approach and descend. The target box leaves the obstacle set (the
+        # cups are about to press onto it); the rest of the stack stays in.
+        await self.move_gripper(down_pose(x, y, z_clear), self.obstacles(exclude_index=seq))
+        await self.move_gripper(down_pose(x, y, z_grasp), self.obstacles(exclude_index=seq))
 
         grabbed = await self.gripper.grab()
+        # the simulated EPick seals after grab_delay_ms, so the first read can
+        # report False before the seal has formed
+        await asyncio.sleep(1.0)
+        if grabbed is False:
+            print(f"grab on box {seq} reported False (seal may still be forming)")
 
+        await helpers.attach_box(self.robot, seq, BOX_H)
 
-        # visually looks like the gripper grabs the box, but it actually fails
-        if grabbed is False: 
-            print(f"Failed to grab box {seq}")
+        home = await helpers.pick_home_pose(self.robot, BOX_H)
+        drop = await helpers.grasp_pose(self.robot, BOX_H)
 
+        # The box visual is parented to the gripper until show_box below, and
+        # that parenting lives on the machine — it survives this process. If a
+        # move fails mid-carry, put the visual back on the pallet instead of
+        # leaving it welded to the arm for every later run.
+        try:
+            # lift straight up, then transit, with the carried box modeled
+            await self.move_gripper(
+                down_pose(x, y, z_clear), self.obstacles(held=True, exclude_index=seq)
+            )
+            await self.move_gripper(home, self.obstacles(held=True, exclude_index=seq))
+            # straight down onto the station (a vertical lower is not a drag)
+            await self.move_gripper(
+                down_pose(drop.x, drop.y, drop.z), self.obstacles(exclude_index=seq)
+            )
+        except Exception:
+            await helpers.show_box(self.robot, seq, x, y, z_center)
+            raise
 
-
-        # Visualization: not sure if it will work
-        await helpers.attach_box(self.robot, seq, BOX_H,)
-
-        # no longer part of the pallet stack
+        # release, land the visual on the station, and only now take the box
+        # off the stack — a failed carry above stays retryable
+        await self.gripper.open()
+        await helpers.show_box(self.robot, seq, drop.x, drop.y, drop.z - BOX_H / 2)
         self.placed.pop()
 
-        #lift straight up
-        await self.move_gripper(down_pose(x,y,z_clear), self.obstacles(),)
-
-        # return to pick station
-        home = await helpers.pick_home_pose(self.robot, BOX_H,)
-
-        drop = await helpers.grasp_pose(self.robot, BOX_H,)
-
-        # good approach
-        await self.move_gripper(home, self.obstacles(),)
-
-        # Lower box back to station
-        await self.move_gripper(down_pose(drop.x, drop.y, drop.z), self.obstacles(),)
-
-        # release
-        await self.gripper.open()
-        await helpers.show_box(self.robot, seq, drop.x, drop.y, drop.z - BOX_H/2)
-        # return up
-        await self.move_gripper(home, self.obstacles(),)
-
+        await self.move_gripper(home, self.obstacles())
         return True
 
     async def unpack(self):
-        """Remove box from pallet (top to bottom)"""
-
+        """Remove boxes from the pallet (top to bottom)."""
         while self.placed:
-            await self.remove()
+            if not await self.remove():
+                break
+
+    async def clear(self):
+        """Clear every box visual — recovers a box left stuck to the gripper."""
+        await helpers.clear_boxes(self.robot)
+        self.placed = []
 
 # verb -> method. One entry per capability.
 STEPS = {
@@ -253,6 +234,7 @@ STEPS = {
     "place": Palletizer.place,
     "remove": Palletizer.remove,
     "unpack": Palletizer.unpack,
+    "clear": Palletizer.clear,
     "run": Palletizer.run,
 }
 
