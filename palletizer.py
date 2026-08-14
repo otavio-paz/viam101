@@ -3,6 +3,7 @@ import sys
 import helpers
 from viam.components.gripper import Gripper
 from viam.services.motion import MotionClient
+from viam.proto.common import Pose, PoseInFrame
 from helpers import connect
 from viam.components.arm import Arm
 from viam.proto.component.arm import JointPositions
@@ -73,9 +74,7 @@ class Palletizer:
         """Pick the box at the pick-station and lift it (box ends up held)."""
         home = await helpers.pick_home_pose(self.robot, BOX_H)
         grasp = await helpers.grasp_pose(self.robot, BOX_H)
-        # nothing is held yet — modeling a phantom held box here makes the
-        # planner refuse start poses that touch the stack
-        await self.move_gripper(home, self.obstacles())
+        await self.move_gripper(home, self.obstacles(held=True))
         await helpers.show_box(self.robot, seq, grasp.x, grasp.y, grasp.z - BOX_H / 2)
         await self.move_gripper(down_pose(grasp.x, grasp.y, grasp.z - GRASP_DEPTH))
         await self.gripper.grab()
@@ -122,6 +121,11 @@ class Palletizer:
         await helpers.show_box(self.robot, seq, x, y, z_tip - BOX_H / 2)
         self.placed.append((x, y, z_tip - BOX_H / 2))
 
+        # await self.move_gripper(down_pose(x, y, z_tip), self.obstacles())
+        # await self.gripper.open()
+        # await helpers.show_box(self.robot, seq, x, y, z_tip - BOX_H / 2)
+        # self.placed.append((x, y, z_tip - BOX_H / 2))
+
     async def run(self):
         """Pack the whole pallet: two layers of four."""
         await helpers.clear_boxes(self.robot)
@@ -147,11 +151,23 @@ class Palletizer:
                 )],
             )
 
+        # obs = [cuboid(f"placed-{i}", "world", x, y, z)
+        #     for i, (x, y, z) in enumerate(self.placed)]
+        # if held:
+        #     obs.append(cuboid("held", helpers.GRIPPER, 0, 0, BOX_H / 2))
+        # return WorldState(obstacles=obs) if obs else None
+
         obs = [cuboid(f"placed-{i}", "world", x, y, z)
-               for i, (x, y, z) in enumerate(self.placed)
-               if i != exclude_index]
-        if held:
-            obs.append(cuboid("held", helpers.GRIPPER, 0, 0, BOX_H / 2))
+        for i, (x, y, z) in enumerate(self.placed)
+        if i != exclude_index]
+
+        # this is causing 
+        '''
+        grpclib.exceptions.GRPCError: (<Status.UNKNOWN: 2>, 'fatal early collision: obstacle constraint:
+        violation between gripper-1:epick-bracket and held geometries', None)
+        '''
+        # if held:
+        #     obs.append(cuboid("held", helpers.GRIPPER, 0, 0, BOX_H / 2))
         return WorldState(obstacles=obs) if obs else None
 
     async def remove(self):
@@ -191,12 +207,11 @@ class Palletizer:
         # move fails mid-carry, put the visual back on the pallet instead of
         # leaving it welded to the arm for every later run.
         try:
-            # lift straight up, then transit, with the carried box modeled
-            await self.move_gripper(
-                down_pose(x, y, z_clear), self.obstacles(held=True, exclude_index=seq)
-            )
-            await self.move_gripper(home, self.obstacles(held=True, exclude_index=seq))
-            # straight down onto the station (a vertical lower is not a drag)
+            # lift straight up, transit, then straight down onto the station.
+            # The target box is still in self.placed until the drop succeeds,
+            # so keep excluding it — its recorded pallet pose is stale now.
+            await self.move_gripper(down_pose(x, y, z_clear), self.obstacles(exclude_index=seq))
+            await self.move_gripper(home, self.obstacles(exclude_index=seq))
             await self.move_gripper(
                 down_pose(drop.x, drop.y, drop.z), self.obstacles(exclude_index=seq)
             )
@@ -214,10 +229,10 @@ class Palletizer:
         return True
 
     async def unpack(self):
-        """Remove boxes from the pallet (top to bottom)."""
+        """Remove box from pallet (top to bottom)"""
+
         while self.placed:
-            if not await self.remove():
-                break
+            await self.remove()
 
     async def clear(self):
         """Clear every box visual — recovers a box left stuck to the gripper."""
