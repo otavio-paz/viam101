@@ -215,19 +215,26 @@ class Palletizer:
         # no longer part of the pallet stack
         self.placed.pop()
 
-        #lift straight up
-        await self.move_gripper(down_pose(x,y,z_clear), self.obstacles(),)
+        # attach_box parents the visual to the gripper on the machine itself, so
+        # it outlives this process — if a move fails mid-carry, put the visual
+        # back on the pallet instead of leaving it stuck to the arm forever
+        try:
+            #lift straight up
+            await self.move_gripper(down_pose(x,y,z_clear), self.obstacles(),)
 
-        # return to pick station
-        home = await helpers.pick_home_pose(self.robot, BOX_H,)
+            # return to pick station
+            home = await helpers.pick_home_pose(self.robot, BOX_H,)
 
-        drop = await helpers.grasp_pose(self.robot, BOX_H,)
+            drop = await helpers.grasp_pose(self.robot, BOX_H,)
 
-        # good approach
-        await self.move_gripper(home, self.obstacles(),)
+            # good approach
+            await self.move_gripper(home, self.obstacles(),)
 
-        # Lower box back to station
-        await self.move_gripper(down_pose(drop.x, drop.y, drop.z), self.obstacles(),)
+            # Lower box back to station
+            await self.move_gripper(down_pose(drop.x, drop.y, drop.z), self.obstacles(),)
+        except Exception:
+            await helpers.show_box(self.robot, seq, x, y, z_center)
+            raise
 
         # release
         await self.gripper.open()
@@ -243,6 +250,11 @@ class Palletizer:
         while self.placed:
             await self.remove()
 
+    async def clear(self):
+        """Clear every box visual — recovers a box left stuck to the gripper."""
+        await helpers.clear_boxes(self.robot)
+        self.placed = []
+
 # verb -> method. One entry per capability.
 STEPS = {
     "resources": Palletizer.resources,
@@ -253,6 +265,7 @@ STEPS = {
     "place": Palletizer.place,
     "remove": Palletizer.remove,
     "unpack": Palletizer.unpack,
+    "clear": Palletizer.clear,
     "run": Palletizer.run,
 }
 
